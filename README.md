@@ -22,13 +22,17 @@ Fixes the notorious bugs in the official **native Linux Discord client** (`disco
 
 ## Quick Install (Works with Discord + Vencord or Stock Discord)
 
+### Option A — One-line install:
 ```bash
-git clone git@github.com:ArenaMMORPG/discord-linux-boost.git
+curl -fsSL https://raw.githubusercontent.com/ArenaMMORPG/discord-linux-boost/main/install.sh | bash
+```
+
+### Option B — Clone & install:
+```bash
+git clone https://github.com/ArenaMMORPG/discord-linux-boost.git
 cd discord-linux-boost
-chmod +x install.sh uninstall.sh
 ./install.sh
 ```
-*(Or via HTTPS: `git clone https://github.com/ArenaMMORPG/discord-linux-boost.git`)*
 
 After running `./install.sh`, **quit Discord completely** from the system tray (`killall Discord`) and start it again.
 
@@ -136,10 +140,15 @@ Result in `pactl list source-outputs`:
 
 ## Установка (одной командой)
 
+### Вариант А — Быстрая установка в 1 строчку:
 ```bash
-git clone git@github.com:ArenaMMORPG/discord-linux-boost.git
+curl -fsSL https://raw.githubusercontent.com/ArenaMMORPG/discord-linux-boost/main/install.sh | bash
+```
+
+### Вариант Б — Через клонирование репозитория:
+```bash
+git clone https://github.com/ArenaMMORPG/discord-linux-boost.git
 cd discord-linux-boost
-chmod +x install.sh uninstall.sh
 ./install.sh
 ```
 

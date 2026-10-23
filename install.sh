@@ -5,12 +5,17 @@ echo "============================================================"
 echo "  Discord Linux Boost & Audio/Wayland Fix Installer"
 echo "============================================================"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 TARGET_DIR="$HOME/.config/Vencord"
 BOOST_PATH="$TARGET_DIR/discord-boost.js"
 
 mkdir -p "$TARGET_DIR"
-cp -f "$SCRIPT_DIR/discord-boost.js" "$BOOST_PATH"
+if [ -f "$SCRIPT_DIR/discord-boost.js" ]; then
+    cp -f "$SCRIPT_DIR/discord-boost.js" "$BOOST_PATH"
+else
+    echo "[*] Downloading discord-boost.js from GitHub..."
+    curl -fsSL "https://raw.githubusercontent.com/ArenaMMORPG/discord-linux-boost/main/discord-boost.js" -o "$BOOST_PATH"
+fi
 echo "[+] Installed preloader to: $BOOST_PATH"
 
 # 1. Fix WirePlumber persistent mute on discord_capture
