@@ -11,10 +11,10 @@ Fixes the notorious bugs in the official **native Linux Discord client** (`disco
 
 | # | Bug in Official Linux Discord | Root Cause | Fix Applied by `discord-linux-boost` |
 |---|---|---|---|
-| **1** | **Complete silence on Screen Share (Go Live)** | WirePlumber saves `"mute":true` for `Input/Audio:application.name:discord_capture` in `~/.local/state/wireplumber/stream-properties`. In addition, Chromium's `speech-dispatcher` (`sd_dummy`) opens an uncorked stream that outputs `0 bytes/s`, blocking `PulseAudioController::ReadAvailable()`'s `MIN` loop. | Automatically unmutes `discord_capture` in WirePlumber state & live `pactl`, and sets `DisableAutoSpawn` for `speech-dispatcher`. |
-| **2** | **Screen Share audio stutter / buffer desync / "helicopter `krrrr` sound"** | In `discord_voice.node`, `PulseAudioController::MonitorSinkInput()` (`0x470bb2`) calls `pa_stream_connect_record(stream, NULL, NULL, 0)` with `attr = NULL` and `flags = 0`. On `pipewire-pulse`, `attr = NULL` sets **`fragsize = 384000` bytes (2.0 seconds!)** and **`node.latency = 96000/48000` (2.0s)**, buffering audio for 2 seconds and dumping giant **`65536`-byte (`341.33 ms` = 34 frames)** bursts every `341 ms` instead of `10 ms` frames. | Binary-patches `MonitorSinkInput` (`0x470ba9..0x470be5`) to pass `pa_buffer_attr { fragsize = 1920 }` and `PA_STREAM_ADJUST_LATENCY (0x2000)`. PipeWire sets `node.latency = 480/48000` (`10 ms`) and delivers exact `1920`-byte (`10 ms`) chunks every `10 ms`. |
+| **1** | **Complete silence on Screen Share (Go Live)** | WirePlumber saves `"mute":true` for `Input/Audio:application.name:discord_capture` in `~/.local/state/wireplumber/stream-properties`. In addition, Chromium's `speech-dispatcher` (`sd_dummy`) opens an uncorked stream that outputs `0 bytes/s`, blocking `PulseAudioController::ReadAvailable()`'s `MIN` loop, and `SinkIdentified` drops window audio when the game's audio worker PID differs from the window PID. | Automatically unmutes `discord_capture` in WirePlumber state & live `pactl`, sets `DisableAutoSpawn` for `speech-dispatcher`, and patches `SinkIdentified` (`0x47177e`) to capture all non-Discord audio streams. |
+| **2** | **Screen Share audio stutter, crackling & buffer desynchronization** | In `discord_voice.node`, `PulseAudioController::MonitorSinkInput()` (`0x470bb2`) calls `pa_stream_connect_record(stream, NULL, NULL, 0)` with `attr = NULL` and `flags = 0`. On `pipewire-pulse`, `attr = NULL` sets **`fragsize = 384000` bytes (2.0 seconds)** and **`node.latency = 96000/48000` (2.0s)**, buffering audio for 2 seconds and delivering **`65536`-byte (`341.33 ms` = 34 frames)** bursts every `341 ms` instead of `10 ms` frames. | Binary-patches `MonitorSinkInput` (`0x470ba9..0x470be5`) to pass `pa_buffer_attr { fragsize = 1920 }` and `PA_STREAM_ADJUST_LATENCY (0x2000)`. PipeWire sets `node.latency = 480/48000` (`10 ms`) and delivers exact `1920`-byte (`10 ms`) chunks every `10 ms`. |
 | **3** | **KDE Wayland *"Global Shortcuts Requested"* popup & broken Push-to-Talk keys (`F13–F24`, `UNK197`, `Numpad *`)** | Under Wayland, `discord_utils.node` (`0x8bd58`) queries `org.freedesktop.portal.GlobalShortcuts`, triggering a modal dialog on every startup/keybind change and dropping non-standard keycodes. | Binary-patches `discord_utils.node` (`48 8d 3d 48 f4 08 00` → `e9 19 04 00 00 66 90`) to jump directly into the native X11/XWayland (`XInput2`) listener. Zero popups, all keys work globally. |
-| **4** | **Incoming stream video frame-jumping (`+1/-1` frame bounce jitter on NVIDIA Wayland)** | Enabling `AcceleratedVideoDecodeLinuxZeroCopyGL` on NVIDIA Wayland (`nvidia-vaapi-driver` / NVDEC) causes EGL image presentation race conditions (out-of-order frames). Also, forcing `callBitRate` on incoming connections breaks WebRTC receiver BWE. | Enables hardware NVDEC/NVENC/VAAPI (`AcceleratedVideoDecodeLinuxGL`, `AcceleratedVideoEncoder`, `VaapiVideoEncoder`) while explicitly disabling `AcceleratedVideoDecodeLinuxZeroCopyGL`, and restricts bitrate boosts to **outgoing** streams only. |
+| **4** | **Incoming stream video frame-jumping (out-of-order frame jitter on NVIDIA Wayland)** | Enabling `AcceleratedVideoDecodeLinuxZeroCopyGL` on NVIDIA Wayland (`nvidia-vaapi-driver` / NVDEC) causes EGL image presentation race conditions (out-of-order frames). Also, forcing `callBitRate` on incoming connections breaks WebRTC receiver BWE. | Enables hardware NVDEC/NVENC/VAAPI (`AcceleratedVideoDecodeLinuxGL`, `AcceleratedVideoEncoder`, `VaapiVideoEncoder`) while explicitly disabling `AcceleratedVideoDecodeLinuxZeroCopyGL`, and restricts bitrate boosts to **outgoing** streams only. |
 | **5** | **64 kbps Mono audio & blurry screen shares** | Discord defaults voice encoding to `channels = 1`, `64 kbps` and allows video bitrate floor (`encodingVideoMinBitRate`) to drop to `150 kbps`. | Hooks `setTransportOptions` in `discord_voice/index.js` to unlock **Stereo 160 kbps Opus** and **4–12 Mbps** outgoing video bitrate. |
 | **6** | **Patches wiped on Discord updates (`app-1.0.xxx`)** | Discord's Linux updater unpacks new versions into `~/.config/discord/app-1.0.xxx/`. | Runs as a lightweight Electron main-process preloader before Vencord (`app.asar`), automatically patching newly downloaded `app-1.0.xxx` versions on startup and in the background, plus blocking Sentry/Science telemetry. |
 
@@ -107,20 +107,20 @@ Result in `pactl list source-outputs`:
 
 ---
 
-### 2. Лаги, треск («кррррр» / вертолёт) и рассинхрон звука на стриме («2 разных буфера разного размера»)
-- **Симптомы:** Зрители на стриме слышат периодический рассинхрон и дребезжание/треск звука примерно 3 раза в секунду (каждые ~20 кадров при 60 fps), особенно при запуске игры и браузера или при нажатии Mute/Unmute.
+### 2. Прерывания, треск и буферная рассинхронизация звука на стриме
+- **Симптомы:** На стороне зрителей звук демонстрации экрана периодически прерывается и искажается (~3 раза в секунду), а также возникают задержки при запуске новых аудиопотоков или переключении Mute/Unmute.
 - **Первопричина в машинном коде `discord_voice.node`:**
   В модуле микрофона (`webrtc::AudioDeviceLinuxPulse::InitRecording`) разработчики передают `fragsize = 1920` байт (`10 мс`) и флаг `PA_STREAM_ADJUST_LATENCY (0x2000)`.
-  Но в функции захвата звука стрима `PulseAudioController::MonitorSinkInput` (`0x470ba9`–`0x470bb2`) они вызвали:
+  Но в функции захвата звука стрима `PulseAudioController::MonitorSinkInput` (`0x470ba9`–`0x470bb2`) вызывается:
   ```c
   pa_stream_connect_record(stream, NULL, NULL, 0);
   ```
-  передав `attr = NULL` и `flags = 0`!
+  с параметрами `attr = NULL` и `flags = 0`.
   Когда в `pipewire-pulse` передаётся `attr = NULL`, PipeWire назначает потоку `discord_capture`:
-  - **`pulse.attr.fragsize = 384000` байт (2.0 секунды!)**
-  - **`node.latency = 96000/48000` (2.0 секунды!)** (в то время как у самой игры, например Dota 2, буфер `1024/44100` ≈ `23 мс` — буквально два буфера разного размера).
-  Из-за этого при старте или пробуждении (uncork) любого аудиопотока `pipewire-pulse` сначала копит буфер до **2.0 секунд**, а затем сливает аудио в Discord не каждые `10 мс` по `1920` байт, а гигантскими пачками по **`65536` байт (`341.33 мс` = 34 фрейма за раз)** раз в `341.33 мс`. На стороне зрителей джиттер-буфер WebRTC NetEq каждые `341 мс` сначала голодает без пакетов, а затем получает залп из 34 фреймов за `< 0.5 мс`.
-- **Решение:** 60-байтный бинарный патч `MonitorSinkInput` (`0x470ba9`..`0x470be5`), передающий `pa_buffer_attr { maxlength=-1, tlength=-1, prebuf=-1, minreq=-1, fragsize=1920 }` и флаг `PA_STREAM_ADJUST_LATENCY (0x2000)`. Теперь `pipewire-pulse` ставит `node.latency = 480/48000` (`10 мс`) и `fragsize = 1920`, отдавая ровно по 1 фрейму каждые `10 мс`.
+  - **`pulse.attr.fragsize = 384000` байт (2.0 секунды)**
+  - **`node.latency = 96000/48000` (2.0 секунды)**
+  Из-за этого при старте или пробуждении (uncork) аудиопотока `pipewire-pulse` буферизует данные до **2.0 секунд**, а затем передаёт аудио в Discord не каждые `10 мс` по `1920` байт, а крупными блоками по **`65536` байт (`341.33 мс` = 34 фрейма за раз)** раз в `341.33 мс`. На стороне зрителей джиттер-буфер WebRTC NetEq каждые `341 мс` сначала опустошается, а затем получает пакет из 34 фреймов за `< 0.5 мс`.
+- **Решение:** 60-байтный бинарный патч `MonitorSinkInput` (`0x470ba9`..`0x470be5`), передающий `pa_buffer_attr { maxlength=-1, tlength=-1, prebuf=-1, minreq=-1, fragsize=1920 }` и флаг `PA_STREAM_ADJUST_LATENCY (0x2000)`. Теперь `pipewire-pulse` выставляет `node.latency = 480/48000` (`10 мс`) и `fragsize = 1920`, доставляя ровно по 1 фрейму каждые `10 мс`.
 
 ---
 
@@ -130,8 +130,8 @@ Result in `pactl list source-outputs`:
 
 ---
 
-### 4. Дёргание видео при просмотре чужих стримов («кадр вперёд — кадр назад») и разблокировка GPU + Stereo 160 kbps Opus + 12 Mbps NVENC
-- **Первопричина:** На драйверах NVIDIA под Wayland (`nvidia-vaapi-driver`) фича `AcceleratedVideoDecodeLinuxZeroCopyGL` вызывает гонку синхронизации EGL-буферов между декодером NVDEC и композитором KWin (кадры N и N+1 выводятся не по порядку). А принудительное завышение `callBitRate` на входящих соединениях ломает оценку полосы пропускания (BWE) при просмотре стримов друзей.
+### 4. Нарушение порядка кадров при просмотре стримов (NVDEC ZeroCopy на Wayland) и разблокировка GPU + Stereo 160 kbps Opus + 12 Mbps NVENC
+- **Первопричина:** На драйверах NVIDIA под Wayland (`nvidia-vaapi-driver`) фича `AcceleratedVideoDecodeLinuxZeroCopyGL` вызывает гонку синхронизации EGL-буферов между декодером NVDEC и композитором KWin (Out-Of-Order Frame Presentation). А принудительное завышение `callBitRate` на входящих соединениях нарушает работу оценки полосы пропускания (BWE) при просмотре входящих трансляций.
 - **Решение:**
   1. Активируется полное аппаратное ускорение GPU (`ignore-gpu-blocklist`, `enable-gpu-rasterization`, `AcceleratedVideoDecodeLinuxGL`, `AcceleratedVideoEncoder`, `VaapiVideoEncoder`, `WebRTCPipeWireCapturer`, отключение фонового троттлинга рендерера), но `AcceleratedVideoDecodeLinuxZeroCopyGL` явно заносится в `--disable-features`.
   2. В `discord_voice/index.js` (`setTransportOptions`) включается **Stereo 160 kbps Opus** и повышается битрейт кодирования видео до **10–12 Мбит/с** строго для **исходящего** стрима (`encodingVideoBitRate` / `encodingVideoMaxBitRate`), не затрагивая входящие потоки.
