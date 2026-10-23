@@ -87,6 +87,18 @@ const VOICE_MONITOR_PATCH = Buffer.from(
     "4c89f731f6488d151b000000b900200000e85105e2ff85c07875eb209090909090909090909090ffffffffffffffffffffffffffffffff8007000090",
     "hex"
 );
+// Also patch SinkIdentified() (0x471775): change jne 471794 (75 14) -> nop; nop (90 90)
+// so that even when streaming a single window on X11/XWayland whose audio comes from a
+// child/container/Proton process with a different PID than the window PID, it still captures
+// the audio (excluding Discord's own getpid()) instead of producing silence!
+const VOICE_PID_CHECK_ORIG = Buffer.from(
+    "8b838002000083f8017514e80b0be2ff4439f80f8491020000",
+    "hex"
+);
+const VOICE_PID_CHECK_PATCH = Buffer.from(
+    "8b838002000083f8019090e80b0be2ff4439f80f8491020000",
+    "hex"
+);
 const VOICE_READ_AVAIL_ORIG = Buffer.from(
     "498b4424288b4010418b8e08f1020029c84801c089d94839c80f43c389c3ebb3",
     "hex"
@@ -103,7 +115,11 @@ function patchDiscordVoiceBinary(nodePath) {
             buf = fs.readFileSync(backupPath);
         }
 
-        if (buf.indexOf(VOICE_MONITOR_PATCH) !== -1 && buf.indexOf(VOICE_READ_AVAIL_ORIG) !== -1) {
+        if (
+            buf.indexOf(VOICE_MONITOR_PATCH) !== -1 &&
+            buf.indexOf(VOICE_PID_CHECK_PATCH) !== -1 &&
+            buf.indexOf(VOICE_READ_AVAIL_ORIG) !== -1
+        ) {
             const diskBuf = fs.readFileSync(nodePath);
             if (diskBuf.equals(buf)) return false;
         }
@@ -118,10 +134,15 @@ function patchDiscordVoiceBinary(nodePath) {
             return false;
         }
 
+        const pidIdx = buf.indexOf(VOICE_PID_CHECK_ORIG);
+        if (pidIdx !== -1) {
+            VOICE_PID_CHECK_PATCH.copy(buf, pidIdx);
+        }
+
         const tmpPath = nodePath + ".boost_tmp";
         fs.writeFileSync(tmpPath, buf, { mode: 0o755 });
         fs.renameSync(tmpPath, nodePath);
-        log("Patched PulseAudioController::MonitorSinkInput (fragsize=1920, PA_STREAM_ADJUST_LATENCY) in", nodePath);
+        log("Patched PulseAudioController (MonitorSinkInput 10ms fragsize + SinkIdentified PID bypass) in", nodePath);
         return true;
     } catch (e) {
         console.warn("[DiscordBoost] Binary patch error:", e.message);
