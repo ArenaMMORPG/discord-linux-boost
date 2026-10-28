@@ -31,6 +31,24 @@ for js in "$HOME"/.config/discord/app-*/modules/discord_voice-*/discord_voice/in
     ' "$js"
 done
 
+# Restore input_capture.js
+for js in "$HOME"/.config/discord/app-*/modules/discord_utils-*/discord_utils/input_capture.js; do
+    [ -e "$js" ] || continue
+    node -e '
+        const fs = require("fs");
+        const p = process.argv[1];
+        const c = fs.readFileSync(p, "utf8");
+        const u = c.replace(
+            /const IS_WAYLAND_SESSION = false;\s*\/\*\s*\[DiscordBoost:ForceX11Input\]\s*\*\/\n/,
+            "const IS_WAYLAND_SESSION = IS_LINUX\n    && (process.env.XDG_SESSION_TYPE?.startsWith(\x27wayland\x27) === true || (process.env.WAYLAND_DISPLAY ?? \x27\x27) !== \x27\x27);\n"
+        );
+        if (u !== c) {
+            fs.writeFileSync(p, u, "utf8");
+            console.log("[+] Restored clean input_capture.js:", p);
+        }
+    ' "$js"
+done
+
 # Restore app.asar (keep Vencord if installed, otherwise restore _app.asar)
 python3 - << 'EOF'
 import struct, glob, os, shutil
