@@ -224,7 +224,7 @@ function patchDiscordVoiceBinary(nodePath) {
 }
 
 // 3. Patch discord_voice/index.js for Stereo 160kbps Opus & 12Mbps NVENC Stream Bitrate
-const VOICE_JS_MARKER = "/* [DiscordBoost:TransportOptions:v3] */";
+const VOICE_JS_MARKER = "/* [DiscordBoost:TransportOptions:v4] */";
 const VOICE_JS_TARGET = "setTransportOptions: (options) => instance.setTransportOptions(options),";
 const VOICE_JS_REPLACEMENT = `setTransportOptions: (options) => { ${VOICE_JS_MARKER}
             try {
@@ -238,11 +238,12 @@ const VOICE_JS_REPLACEMENT = `setTransportOptions: (options) => { ${VOICE_JS_MAR
                     if (options.encodingVoiceBitRate && options.encodingVoiceBitRate < 160000) {
                         options.encodingVoiceBitRate = 160000;
                     }
-                    // Boost video bitrate ONLY when WE are encoding an outgoing stream!
-                    // Do NOT force callBitRate / callMaxBitRate on incoming connections,
-                    // otherwise receiving streams from friends causes jitter buffer oscillation
-                    // and out-of-order frame bouncing (+1/-1 frame).
-                    if (options.encodingVideoBitRate || options.encodingVideoMaxBitRate) {
+                    // Boost video bitrate ONLY when WE are actively sending an outgoing video stream
+                    // (streamParameters[].active === true). Never touch viewer-only stream connections
+                    // (where streamParameters[].active === false).
+                    const isActivelySendingVideo = !Array.isArray(options.streamParameters) ||
+                        options.streamParameters.some((s) => s && s.active === true);
+                    if (isActivelySendingVideo && (options.encodingVideoBitRate || options.encodingVideoMaxBitRate)) {
                         if (options.encodingVideoMinBitRate && options.encodingVideoMinBitRate < 4000000) {
                             options.encodingVideoMinBitRate = 4000000;
                         }
@@ -251,6 +252,15 @@ const VOICE_JS_REPLACEMENT = `setTransportOptions: (options) => { ${VOICE_JS_MAR
                         }
                         if (options.encodingVideoMaxBitRate && options.encodingVideoMaxBitRate < 12000000) {
                             options.encodingVideoMaxBitRate = 12000000;
+                        }
+                        if (Array.isArray(options.streamParameters)) {
+                            for (const sp of options.streamParameters) {
+                                if (sp && sp.active === true && sp.type === 'video') {
+                                    if (sp.minBitrate && sp.minBitrate < 4000000) sp.minBitrate = 4000000;
+                                    if (sp.targetBitrate && sp.targetBitrate < 10000000) sp.targetBitrate = 10000000;
+                                    if (sp.maxBitrate && sp.maxBitrate < 12000000) sp.maxBitrate = 12000000;
+                                }
+                            }
                         }
                     }
                 }
@@ -263,7 +273,7 @@ function patchDiscordVoiceJs(jsPath) {
         if (!fs.existsSync(jsPath)) return false;
         const content = fs.readFileSync(jsPath, "utf8");
         if (content.includes(VOICE_JS_MARKER)) {
-            return false; // Already patched with v3
+            return false; // Already patched with v4
         }
         let updated = content;
         if (content.includes("/* [DiscordBoost:TransportOptions")) {
@@ -279,7 +289,7 @@ function patchDiscordVoiceJs(jsPath) {
 
         if (updated !== content) {
             fs.writeFileSync(jsPath, updated, "utf8");
-            log("Patched Stereo 160kbps Opus & 12Mbps video transport options (v3) in", jsPath);
+            log("Patched Stereo 160kbps Opus & 12Mbps video transport options (v4) in", jsPath);
             return true;
         }
         return false;
@@ -450,34 +460,66 @@ try {
     const electron = require("electron");
     if (electron && electron.app) {
         const { app } = electron;
+        const IS_NVIDIA_GPU = fs.existsSync("/proc/driver/nvidia");
 
-        const REQUIRED_ENABLE_FEATURES = [
-            "AcceleratedVideoDecodeLinuxGL",
-            "AcceleratedVideoDecoder",
-            "AcceleratedVideoEncoder",
-            "VaapiVideoDecodeLinuxGL",
-            "VaapiVideoEncoder",
-            "VaapiIgnoreDriverChecks",
-            "CanvasOopRasterization",
-            "WebRTCPipeWireCapturer"
-        ];
-        // Explicitly disable ZeroCopy video decoding: on NVIDIA Wayland (nvidia-vaapi-driver/NVDEC),
-        // AcceleratedVideoDecodeLinuxZeroCopyGL causes EGL buffer presentation sync race conditions,
-        // resulting in frames jumping forward and backward (+1/-1 frame bounce jitter).
-        const REQUIRED_DISABLE_FEATURES = [
-            "AcceleratedVideoDecodeLinuxZeroCopyGL"
-        ];
+        // GPU Architecture note for Electron 44+ (app-1.0.167+):
+        // - Outgoing streams on NVIDIA use discord_voice.node's built-in native Rust CUDA + NVENC
+        //   encoder (CudaVideoEncoder via libcuda.so.1 / libnvidia-encode.so.1), NOT Chromium VA-API.
+        // - Incoming streams use ElectronVideoDecoder -> Chromium's VideoDecoder pipeline.
+        //   On NVIDIA with libva-nvidia-driver (nvidia-vaapi-driver) installed:
+        //   * Forcing VaapiVideoDecodeLinuxGL + VaapiIgnoreDriverChecks WITHOUT ZeroCopy causes an
+        //     infinite loading spinner (video-stream-receiver-ready-timeout) because libva-nvidia-driver
+        //     only implements DMA-BUF ZeroCopy export and returns VA_STATUS_ERROR_UNIMPLEMENTED for
+        //     non-ZeroCopy surfaces without falling back to software decode.
+        //   * Enabling ZeroCopy (AcceleratedVideoDecodeLinuxZeroCopyGL) on libva-nvidia-driver causes
+        //     +1/-1 out-of-order frame bounce jitter due to missing Wayland explicit sync fences.
+        //   Therefore, on NVIDIA we disable Chromium's VA-API video decoder wrapper so ElectronVideoDecoder
+        //   uses sequential FFmpeg/dav1d decode + hardware OpenGL GPU compositing (streams open in ~20ms
+        //   with zero frame-order bugs), while AMD/Intel Mesa uses native VA-API hardware decode/encode.
+        const REQUIRED_ENABLE_FEATURES = IS_NVIDIA_GPU
+            ? [
+                  "CanvasOopRasterization",
+                  "WebRTCPipeWireCapturer"
+              ]
+            : [
+                  "AcceleratedVideoDecodeLinuxGL",
+                  "AcceleratedVideoDecoder",
+                  "AcceleratedVideoEncoder",
+                  "VaapiVideoDecodeLinuxGL",
+                  "VaapiVideoEncoder",
+                  "VaapiIgnoreDriverChecks",
+                  "CanvasOopRasterization",
+                  "WebRTCPipeWireCapturer"
+              ];
+
+        const REQUIRED_DISABLE_FEATURES = IS_NVIDIA_GPU
+            ? [
+                  "AcceleratedVideoDecodeLinuxGL",
+                  "AcceleratedVideoDecodeLinuxZeroCopyGL",
+                  "AcceleratedVideoDecoder",
+                  "VaapiVideoDecodeLinuxGL",
+                  "VaapiIgnoreDriverChecks"
+              ]
+            : [
+                  "AcceleratedVideoDecodeLinuxZeroCopyGL"
+              ];
 
         const origAppendSwitch = app.commandLine.appendSwitch.bind(app.commandLine);
         app.commandLine.appendSwitch = function (switchName, value) {
             if (switchName === "enable-features") {
+                const existing = app.commandLine.getSwitchValue("enable-features");
+                const existingList = existing ? String(existing).split(",").filter(Boolean) : [];
                 const incoming = value ? String(value).split(",").filter(Boolean) : [];
-                const merged = Array.from(new Set([...incoming, ...REQUIRED_ENABLE_FEATURES])).join(",");
+                const merged = Array.from(new Set([...existingList, ...incoming, ...REQUIRED_ENABLE_FEATURES]))
+                    .filter((f) => !REQUIRED_DISABLE_FEATURES.includes(f))
+                    .join(",");
                 return origAppendSwitch("enable-features", merged);
             }
             if (switchName === "disable-features") {
+                const existing = app.commandLine.getSwitchValue("disable-features");
+                const existingList = existing ? String(existing).split(",").filter(Boolean) : [];
                 const incoming = value ? String(value).split(",").filter(Boolean) : [];
-                const merged = Array.from(new Set([...incoming, ...REQUIRED_DISABLE_FEATURES])).join(",");
+                const merged = Array.from(new Set([...existingList, ...incoming, ...REQUIRED_DISABLE_FEATURES])).join(",");
                 return origAppendSwitch("disable-features", merged);
             }
             return origAppendSwitch(switchName, value);
